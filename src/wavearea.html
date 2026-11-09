@@ -1,3 +1,6 @@
+<!-- wheel zoom (Ctrl/⌘) + pan (Shift) live in a non-passive JS listener
+     attached in wavearea.js — a template listener couldn't preventDefault
+     reliably, and trackpad pinch arrives as ctrl+wheel -->
 <div class="container"
   :ref="refs.container"
   :onscroll.window.throttle-raf:onresize.window.throttle-raf="() => (_trackScroll(), renderWindow())"
@@ -15,8 +18,7 @@
     else if (e.key === '?') showHelp = !showHelp
   }"
   :onkeydown.document.esc="e => (_key(e) || showSettings || showHelp) && esc()"
-  :onwheel.window:ontouchmove.window="() => playing && (_userScrolled = true)"
-  :onwheel="e => e.ctrlKey && total && !loading && (e.preventDefault(), pinch(e))"
+  :onwheel.window:ontouchmove.window="() => playing && _suspendFollow()"
   :onkeydown.document.ctrl-arrowup.prevent:onkeydown.document.meta-arrowup.prevent="() => markJump(-1)"
   :onkeydown.document.ctrl-arrowdown.prevent:onkeydown.document.meta-arrowdown.prevent="() => markJump(1)"
   :onkeydown.document.ctrl-c:onkeydown.document.meta-c="() => copy()"
@@ -416,7 +418,8 @@
       <dt>m</dt><dd>toggle marker (dblclick to label)</dd>
       <dt>Ctrl+↑ ↓</dt><dd>previous / next marker</dd>
       <dt>g</dt><dd>go to time</dd>
-      <dt>Ctrl+scroll</dt><dd>zoom</dd>
+      <dt>Ctrl+scroll</dt><dd>zoom (mouse-anchored)</dd>
+      <dt>Shift+scroll</dt><dd>pan</dd>
       <dt>Esc</dt><dd>clear selection / close</dd>
     </dl>
     <p><a href="https://github.com/audio-lab/wavearea" target="_blank" rel="noopener">github</a> · ॐ</p>

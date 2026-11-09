@@ -206,6 +206,18 @@ function bufferPlayer(getWindow, sr, ch, gbs = () => BLOCK_SIZE) {
       loopEndBlock = end
     },
 
+    // zoom changed the display block size — rescale block-coord bookkeeping
+    // so window continuation and loop bounds still refer to the same samples
+    rescale(ratio) {
+      loopStartBlock *= ratio
+      loopEndBlock *= ratio
+      for (let s of [source, nextSrc]) {
+        if (!s) continue
+        s._fromBlock *= ratio
+        if (s._endBlock != null) s._endBlock *= ratio
+      }
+    },
+
     setVolume(v) {
       vol = v
       fadeTo(v)
@@ -323,6 +335,8 @@ function audioElPlayer(getWindow, sr, ch, gbs = () => BLOCK_SIZE) {
     },
 
     setLoop(start, end) { startBlock = start; el.loop = true },
+    // zoom rescale — keep the loop base on the same samples (see bufferPlayer)
+    rescale(ratio) { startBlock *= ratio },
     setVolume(v) { el.volume = v },
     setSpeed(r) {
       speed = r
@@ -477,6 +491,9 @@ function workletPlayer(getWindow, sr, ch, gbs = () => BLOCK_SIZE) {
       loopStartBlock = start
       loopEndBlock = end
     },
+
+    // zoom rescale — keep loop bounds on the same samples (see bufferPlayer)
+    rescale(ratio) { loopStartBlock *= ratio; loopEndBlock *= ratio },
 
     setVolume(v) { vol = v; gain.gain.setTargetAtTime(v, ctx.currentTime, FADE_TIME / 3) },
 

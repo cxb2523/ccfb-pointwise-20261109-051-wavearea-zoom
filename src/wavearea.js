@@ -227,6 +227,8 @@ export default function wavearea(el, {
       this._eaRect = ea.getBoundingClientRect()
       // compute cols from char width (reliable even during loading)
       this.cols = this._charW ? Math.floor(this._eaRect.width / this._charW) || 1 : this.countCols(ea)
+      // horizontal time scale — the viewport's pixels-per-second
+      if (this._charW) this.pixelsPerSecond = this._charW * this.sampleRate / this.blockSize
       this.computeLines(ea)
     },
 
@@ -493,15 +495,71 @@ export default function wavearea(el, {
       console.timeEnd('[stop]')
     },
 
-    // minimap viewport tracking (scroll/resize update these signals)
+    // viewport state — the single source of truth for scroll & zoom:
+    // pixelsPerSecond is the horizontal time scale, scrollTime the audio time
+    // at the viewport origin, viewDuration the audio time visible. Selection
+    // and playhead stay in the time domain (blocks); view ops never rewrite
+    // them — scrollFrac/viewFrac are derived from scrollTime/viewDuration.
+    pixelsPerSecond: 0,
+    scrollTime: 0,
+    viewDuration: 0,
     scrollFrac: 0,
     viewFrac: 1,
 
     _trackScroll() {
       let doc = document.documentElement
-      let max = Math.max(1, doc.scrollHeight)
-      this.scrollFrac = scrollY / max
-      this.viewFrac = Math.min(1, innerHeight / max)
+      if (!this.total || !this.refs.editarea) {
+        let max = Math.max(1, doc.scrollHeight)
+        this.scrollFrac = scrollY / max
+        this.viewFrac = Math.min(1, innerHeight / max)
+        return
+      }
+      if (this._charW) this.pixelsPerSecond = this._charW * this.sampleRate / this.blockSize
+      // viewport extent in audio time — visible lines × seconds per line
+      // (a layout property, independent of scroll position)
+      let secPerLine = (this.cols || 1) * this.blockSize / this.sampleRate
+      this.viewDuration = this.duration
+        ? Math.min(this.duration, innerHeight / (this._lineH || 70) * secPerLine)
+        : 0
+      // clamp to content — short audio can't scroll into negative time
+      this.scrollTime = Math.max(0, Math.min(this._timeAtY(scrollY), Math.max(0, this.duration - this.viewDuration)))
+      this.scrollFrac = this.duration ? this.scrollTime / this.duration : 0
+      this.viewFrac = this.duration ? Math.min(1, this.viewDuration / this.duration) : 1
+    },
+
+    // audio time at a document Y (px), interpolated between line starts
+    _timeAtY(y) {
+      let ea = this.refs.editarea, offs = this.lineOffsets
+      if (!ea || !this.total || !offs?.length) return 0
+      let lineH = this._lineH || 70
+      // virtual line 0 sits at the editarea's border-box top (padding compensates)
+      let ly = (y - ea.getBoundingClientRect().top - scrollY) / lineH
+      let li = Math.max(0, Math.min(offs.length - 1, Math.floor(ly)))
+      let frac = Math.max(0, Math.min(1, ly - li))
+      let b0 = offs[li] ?? 0, b1 = offs[li + 1] ?? this.total
+      return (b0 + frac * (b1 - b0)) * this.blockSize / this.sampleRate
+    },
+
+    // inverse of _timeAtY — document Y (px) where an audio time lands
+    _yAtTime(t) {
+      let ea = this.refs.editarea
+      if (!ea || !this.total) return 0
+      let lineH = this._lineH || 70
+      let block = Math.max(0, Math.min(t * this.sampleRate / this.blockSize, this.total))
+      let li = this.lineFromBlock(block)
+      let b0 = this.lineOffsets[li] ?? 0, b1 = this.lineOffsets[li + 1] ?? this.total
+      let frac = b1 > b0 ? (block - b0) / (b1 - b0) : 0
+      return ea.getBoundingClientRect().top + scrollY + (li + frac) * lineH
+    },
+
+    // scroll the document so audio time t sits at the viewport origin
+    _scrollToTime(t) {
+      if (!this.total) return
+      // clamp to content — short audio can't scroll into negative time
+      t = Math.max(0, Math.min(t, Math.max(0, this.duration - this.viewDuration)))
+      scrollTo({ top: Math.max(0, this._yAtTime(t)) })
+      this.scrollTime = t  // _trackScroll resyncs from the real scrollY
+      this.renderWindow()
     },
 
     // re-query coarse whole-file stats, then redraw (edits change the audio)
@@ -552,13 +610,15 @@ export default function wavearea(el, {
       for (let b of this.marks) ctx.fillRect(X(b) - 1, 0, 2, h / 3)
     },
 
-    // click/drag the minimap to scroll the document
+    // click/drag the minimap to scroll the document (CSS-pixel coords — the
+    // canvas backing store is DPR-scaled and never touched with clientX)
     minimapSeek(e) {
       let el = this.refs.minimapBox
       let scroll = ev => {
         let r = el.getBoundingClientRect()
         let f = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width))
-        scrollTo({ top: f * document.documentElement.scrollHeight - innerHeight / 2 })
+        if (this.playing) this._suspendFollow()  // manual pan suspends follow
+        this._scrollToTime(f * this.duration - this.viewDuration / 2)
       }
       scroll(e)
       let up = () => { removeEventListener('pointermove', scroll); removeEventListener('pointerup', up) }
@@ -1173,28 +1233,70 @@ export default function wavearea(el, {
       this.loading = false
     },
 
-    // Ctrl+scroll / trackpad pinch (browsers report pinch as ctrl+wheel) —
-    // accumulate deltas into discrete zoom steps; caret position is preserved
-    _pinchAcc: 0,
-    pinch(e) {
-      this._pinchAcc += e.deltaY
-      if (Math.abs(this._pinchAcc) < 50) return
-      let dir = this._pinchAcc < 0 ? 1 : -1
-      this._pinchAcc = 0
-      this.zoom(dir)
+    // unified wheel handling: Ctrl/⌘+wheel (trackpad pinch reports as
+    // ctrl+wheel) zooms around the mouse, Shift+wheel pans through time.
+    // Attached non-passive from wavearea() so preventDefault actually blocks
+    // the native scroll/browser-zoom.
+    _wheelAcc: 0,
+    onWheel(e) {
+      if (!this.total || this.loading) return
+      // normalize deltas to pixels (deltaMode: 0 = px, 1 = lines, 2 = pages)
+      let dx = e.deltaX, dy = e.deltaY
+      if (e.deltaMode === 1) { dx *= this._lineH || 20; dy *= this._lineH || 20 }
+      else if (e.deltaMode === 2) { dx *= innerWidth; dy *= innerHeight }
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault()
+        // accumulate trackpad pinch deltas into discrete zoom steps
+        this._wheelAcc += dy
+        if (Math.abs(this._wheelAcc) < 50) return
+        let dir = this._wheelAcc < 0 ? 1 : -1
+        this._wheelAcc = 0
+        if (this.playing) this._suspendFollow()  // manual view op suspends follow
+        this.zoom(dir, this._anchorFromEvent(e))
+      } else if (e.shiftKey) {
+        e.preventDefault()
+        if (this.playing) this._suspendFollow()
+        let d = Math.abs(dx) > Math.abs(dy) ? dx : dy
+        this._scrollToTime(this.scrollTime + d / (this.pixelsPerSecond || 1))
+      }
+      // plain wheel: native document scroll — _trackScroll keeps scrollTime synced
     },
 
-    // zoom: change display block size (samples per char); coords rescale.
+    // zoom anchor: the audio time under the cursor + its viewport fraction.
+    // After the zoom, scrollTime = anchorTime − frac × viewDuration puts the
+    // same time back under the cursor (the anchorTime − offsetX/pps formula,
+    // expressed in viewport-fraction units for the wrapped layout). The time
+    // is read with the same _timeAtY mapping as scrollTime — mixing in a
+    // horizontal within-line position would skew the anchor by half a line.
+    _anchorFromEvent(e) {
+      return {
+        time: this._timeAtY(scrollY + (e.clientY || 0)),
+        frac: innerHeight ? Math.max(0, Math.min(1, (e.clientY || 0) / innerHeight)) : 0.5,
+      }
+    },
+
+    // zoom: change display block size (samples per char); block coords rescale,
+    // selection/playhead times are untouched. anchor = { time, frac } is held
+    // fixed in the viewport (mouse-anchored wheel zoom); defaults to the caret.
     // levels start at engine stats granularity (1024) — finer needs raw PCM stats
-    zoom(dir) {
+    zoom(dir, anchor) {
       if (!this.total || this.loading) return
       const LEVELS = [1024, 2048, 4096, 8192]
       let i = LEVELS.indexOf(this.blockSize)
       let ni = Math.max(0, Math.min(LEVELS.length - 1, i - dir))
       if (ni === i || i < 0) return
+      anchor ??= { time: this.caretOffset * this.blockSize / this.sampleRate, frac: 0.5 }
       return this._edit(async () => {
-        this._hold()
         let ratio = this.blockSize / LEVELS[ni]
+        // rebase the playhead interpolation onto the new scale — the audio
+        // clock (startedAt, player offset) is NOT touched by a view operation.
+        // (skipped until onstarted has supplied real clock anchors)
+        if (this.playing && player && this._rafId) {
+          let now = player.currentTime
+          this._playStartBlock = (this._playStartBlock + (now - this._playStartTime) * this.sampleRate / this.blockSize * this.speed) * ratio
+          this._playStartTime = now
+        }
+        if (this.playing && player) player.rescale?.(ratio)
         this.blockSize = LEVELS[ni]
         api.setBlockSize(this.blockSize)
         let scale = x => Math.round(x * ratio)
@@ -1205,14 +1307,19 @@ export default function wavearea(el, {
         this.marks = [...new Set(this.marks.map(scale))].sort((a, b) => a - b)
         this.markL = L
         if (this._clip) this._clip = { ...this._clip, from: scale(this._clip.from), to: scale(this._clip.to) }
+        // selection times don't change — rescale the loop range so its borders
+        // and handles redraw around the same seconds at the new scale
+        let loopRange = this.loop && this.clipEnd != null ? [scale(this.clipStart), scale(this.clipEnd)] : null
         this._applyEdit(await api.rerender(), scale(this.caretOffset))
-        this._syncURL()
-        // zoom during playback: resume at the same audio position in new coords
-        if (this._held) {
-          let at = scale(this._held.at)
-          this._held = null
-          this.seekTo(Math.max(0, Math.min(at, this.total - 1)))
+        if (loopRange) {
+          this.loop = true
+          ;[this.clipStart, this.clipEnd] = loopRange
+          this.selection.set(loopRange[0], loopRange[1])
         }
+        this._syncURL()
+        // hold the anchor at its viewport fraction
+        this._trackScroll()
+        this._scrollToTime(anchor.time - anchor.frac * this.viewDuration)
       })
     },
 
@@ -1375,9 +1482,18 @@ export default function wavearea(el, {
     },
 
     _userScrolled: false,
+    _userScrolledAt: 0,
+
+    // manual view op suspends auto-follow; the timestamp gives the browser a
+    // grace window to apply the native scroll before the caret can re-arm it
+    _suspendFollow() {
+      this._userScrolled = true
+      this._userScrolledAt = performance.now()
+    },
 
     _startCaretAnimation() {
       this._userScrolled = false
+      this._userScrolledAt = 0
       let mouseWait = 0
       let animate = () => {
         if (!this.playing || !player) return
@@ -1411,11 +1527,15 @@ export default function wavearea(el, {
               this.caretX = rect.right
               this.caretY = rect.top
               this.caretLine = this.lineFromBlock(block)
-              // auto-scroll: follow the playing caret unless the user scrolled
-              // away; resume once the caret is back in view. (WebKit returns no
-              // rects for some collapsed ranges — no rect, no scroll decision.)
+              // auto-scroll: follow the playing caret. A manual zoom/pan
+              // suspends following — while suspended the user's position is
+              // held (no yank); follow re-arms once the playhead is visible
+              // and the user's scroll has settled (the native scroll trails
+              // the wheel event, so re-arming needs a grace window).
+              // (WebKit returns no rects for some collapsed ranges — no rect,
+              // no scroll decision.)
               let vis = rect.top >= 0 && rect.bottom <= innerHeight - 40
-              if (vis) this._userScrolled = false
+              if (vis) { if (performance.now() - this._userScrolledAt > 250) this._userScrolled = false }
               else if (!this._userScrolled) this._scrollToLine(this.lineFromBlock(block))
             }
           }
@@ -1474,6 +1594,11 @@ export default function wavearea(el, {
 
   // initialize visual layers
   let cleanups = []
+  // wheel zoom/pan calls preventDefault — attach non-passive explicitly
+  // (window/document-level listeners would be passive by default)
+  let onWheel = e => state.onWheel(e)
+  el.addEventListener('wheel', onWheel, { passive: false })
+  cleanups.push(() => el.removeEventListener('wheel', onWheel))
   let layers = [
     caret === 'smooth' && _smoothCaret(typeof caret === 'object' ? caret : {}),
     loopHighlight && _loopHighlight(typeof loopHighlight === 'object' ? loopHighlight : {}),
