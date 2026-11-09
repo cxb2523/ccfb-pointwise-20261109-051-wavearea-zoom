@@ -1,0 +1,435 @@
+<div class="container"
+  :ref="refs.container"
+  :onscroll.window.throttle-raf:onresize.window.throttle-raf="() => (_trackScroll(), renderWindow())"
+  :onmousedown.document..onmouseup.document="e=> (isMouseDown = true, loop = false, clipEnd = null, e.target.closest?.('#editarea') && window.getSelection().removeAllRanges(), e=> isMouseDown = false)"
+  :onkeydown.document.delete="e => _key(e) && (e.preventDefault(), del(e.key === 'Backspace' ? -1 : 1, e.repeat))"
+  :onkeydown.document.ctrl-z.prevent:onkeydown.document.meta-z.prevent="e => e.shiftKey ? redo() : undo()"
+  :onkeydown.document.space="e => _key(e) && (e.preventDefault(), e.ctrlKey || e.metaKey || sil(e.repeat))"
+  :onkeydown.document.enter="e => _key(e) && (e.preventDefault(), br())"
+  :onkeydown.document="e => {
+    if (!_key(e)) return
+    if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(e.key)) return caretKey(e)
+    if (e.ctrlKey || e.metaKey || e.altKey) return
+    if (e.key === 'm') mark()
+    else if (e.key === 'g' && total) { refs.jump.hidden = false; refs.jump.value = ''; refs.jump.focus() }
+    else if (e.key === '?') showHelp = !showHelp
+  }"
+  :onkeydown.document.esc="e => (_key(e) || showSettings || showHelp) && esc()"
+  :onwheel.window:ontouchmove.window="() => playing && (_userScrolled = true)"
+  :onwheel="e => e.ctrlKey && total && !loading && (e.preventDefault(), pinch(e))"
+  :onkeydown.document.ctrl-arrowup.prevent:onkeydown.document.meta-arrowup.prevent="() => markJump(-1)"
+  :onkeydown.document.ctrl-arrowdown.prevent:onkeydown.document.meta-arrowdown.prevent="() => markJump(1)"
+  :onkeydown.document.ctrl-c:onkeydown.document.meta-c="() => copy()"
+  :onkeydown.document.ctrl-x.prevent:onkeydown.document.meta-x.prevent="() => cut()"
+  :onkeydown.document.ctrl-v.prevent:onkeydown.document.meta-v.prevent="() => paste()"
+  :style="{
+    '--cols': cols,
+    '--carety': (caretY - (refs.editarea?.getBoundingClientRect().top ?? 0)) + 'px',
+    '--caretx': (caretX - (refs.editarea?.getBoundingClientRect().left ?? 0)) + 'px'
+  }">
+  <div id="waveform"
+    :ref="refs.waveform"
+    :if="total">
+    <span id="caret-line"></span>
+
+    <div id="editarea" class="wavefont" inputmode="none"
+      :ref="refs.editarea"
+      :class="{'playing':playing}"
+      :resize.throttle-raf="() => (measureWaveform(), computeRawLines(), renderWindow(true))"
+      :onclick:onkeyup.arrow:ontouchend:onselect:onfocus:onkeydown.arrow.throttle-raf="
+        let sel = selection.get()
+        if (!sel) return
+        if (!playing && sel.start === caretOffset && sel.collapsed) return
+
+        caretOffset = sel.start;
+        caretLine = lineFromBlock(sel.end);
+
+        let rects = sel.range.getClientRects()
+        let rect = rects[rects.length - 1]
+        if (!rect) return
+        caretX = rect.right
+        caretY = rect.top
+
+        clipStart = sel.start;
+        if (playing) {
+          if (!sel.collapsed) {
+            clipEnd = sel.end
+            loop = true
+            seekTo(sel.start, sel.end, true)
+          } else {
+            loop = false
+            seekTo(caretOffset)
+          }
+        } else {
+          clipEnd = !sel.collapsed ? sel.end : total;
+          loop = !sel.collapsed;
+        }
+      "
+      :ondragenter..ondragleave:ondragenter..ondrop="e=>(editarea.classList.add('dragover'),e=>editarea.classList.remove('dragover'))"
+      :ondragover.prevent="e=>e"
+      :ondrop.prevent="e => drop(e)"
+      :ondblclick.prevent="e => selectSegment(e)"
+      ></div>
+
+    <div id="marks">
+      <span class="mark" :each="b in marks" :style="markPos(b)" :title="`${timecode(b, 2)} — double-click to label`"
+        :onclick="() => jumpTo(b)"
+        :ondblclick.prevent.stop="() => markEditStart(b)">
+        <span class="mark-label" :if="markL[b] != null" :text="markL[b]"></span>
+      </span>
+      <!-- blur() rather than hidden: WebKit keeps focus on hidden elements,
+           which would swallow every global key through the _key guard -->
+      <input id="mark-label-input" hidden aria-label="Marker label"
+        :ref="refs.markLabel"
+        placeholder="label"
+        :onkeydown.enter.prevent.stop="e => (setMarkLabel(markEdit, e.target.value), e.target.blur())"
+        :onkeydown.esc.stop="e => e.target.blur()"
+        :onblur="e => (markEdit = null, e.target.hidden = true)"
+        :onmousedown.stop:ondblclick.stop="e=>e" />
+    </div>
+
+    <div id="timecodes" :ref="refs.timecodes" :style="{paddingTop: winStart * _lineH + 'px'}">
+      <!-- caret row hides + — the floater's play button sits in its gutter slot -->
+      <span class="tc" :each="li in winLines" :data-id="li" :class="{'caret-row': li === caretLine}"
+        ><button class="add-mark" aria-label="Add marker at this line" title="Add marker here"
+          :onclick.prevent="() => markAt(lineOffsets[li] ?? 0)">+</button
+        ><a :href="`#${timecode(lineOffsets[li] ?? 0)}`" :text="timecode(lineOffsets[li] ?? 0)"
+          :onclick.prevent="() => jumpTo(lineOffsets[li] ?? 0)"></a></span>
+    </div>
+
+    <div id="floater" :ref="refs.floater"
+      :class="{'loaded': total && !loading}"
+      :fx.delay="caretLine, winLines; refs.timecodes?.querySelector(`[data-id='${caretLine}']`)?.before(refs.floater)">
+      <button id="play" aria-label="Play/pause"
+        :ref="refs.playButton"
+        :hidden="!total || loading"
+        :title="loading ? loading : `${playing ? 'Pause' : 'Play'} (Ctrl+Space)`"
+        :onclick:onkeydown.document.ctrl-space.prevent:onkeydown.document.meta-space.prevent..onclick:onkeydown.document.ctrl-space.prevent:onkeydown.document.meta-space.prevent="() => play()"
+        tabindex="-1">
+        <span class="clickarea"></span>
+        <svg :if="!playing" xmlns="http://www.w3.org/2000/svg"
+            height="24px" viewBox="0 0 24 24" width="24px" fill="#000000">
+          <path d="M0 0h24v24H0V0z" fill="none" />
+          <path d="M8 5v14l11-7L8 5z" />
+        </svg>
+        <svg :else xmlns="http://www.w3.org/2000/svg"
+            height="24px" viewBox="0 0 24 24" width="24px" fill="#000000">
+          <path d="M0 0h24v24H0V0z" fill="none" />
+          <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
+        </svg>
+      </button>
+      <button id="trim" class="op"
+      aria-label="Trim to selection"
+        :hidden="!total || loading || !loop"
+        title="Trim to selection"
+        :onmousedown.stop.prevent="() => trim()"
+        tabindex="-1">
+        <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+          <path d="M0 0h24v24H0z" fill="none" />
+          <path d="M17 15h2V7c0-1.1-.9-2-2-2H9v2h8v8zM7 17V1H5v4H1v2h4v10c0 1.1.9 2 2 2h10v4h2v-4h4v-2H7z" />
+        </svg>
+      </button>
+      <button id="fadein" class="op"
+      aria-label="Fade in selection"
+        :hidden="!total || loading || !loop"
+        title="Fade in selection"
+        :onmousedown.stop.prevent="() => fade(1)"
+        tabindex="-1">
+        <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+          <path d="M0 0h24v24H0z" fill="none" />
+          <path d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z" />
+        </svg>
+      </button>
+      <button id="fadeout" class="op"
+      aria-label="Fade out selection"
+        :hidden="!total || loading || !loop"
+        title="Fade out selection"
+        :onmousedown.stop.prevent="() => fade(-1)"
+        tabindex="-1">
+        <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+          <path d="M0 0h24v24H0z" fill="none" />
+          <path d="M16 18l2.29-2.29-4.88-4.88-4 4L2 7.41 3.41 6l6 6 4-4 6.3 6.29L22 12v6z" />
+        </svg>
+      </button>
+      <span id="gain" :hidden="!total || loading || !loop">
+        <input id="gain-db" type="number" min="-24" max="24" step="1" aria-label="Gain, dB"
+          :ref="refs.gainDb"
+          title="Amplify selection, dB (Enter applies)"
+          :value="settings.gainDb"
+          :onmousedown.stop="e=>e"
+          :onkeydown.enter.prevent.stop="e => gain(e.target.value)" />
+        <button id="gain-apply" class="op" aria-label="Apply gain"
+          title="Amplify selection by dB"
+          :onmousedown.stop.prevent="() => gain(refs.gainDb?.value)"
+          tabindex="-1"><span class="fmt">dB</span></button>
+      </span>
+    </div>
+  </div>
+
+  <div id="opener"
+    :if="!total && !loading"
+    :fx="refreshFiles()"
+    :ondragover.prevent="e=>e"
+    :ondrop.prevent="e => { let f = [...e.dataTransfer.files].find(f => f.type.startsWith('audio')); f && loadAudio(f, { save: true }) }">
+    <nav>
+      <input id="file" type="file"
+            accept="audio/x-m4a,audio/mp3,audio/amr,audio/aiff,audio/wav,audio/*"
+            :onchange="e => loadAudio(e.target.files[0], { save: true })" />
+      <label for="file" class="open-action" title="Open audio file">
+        <svg width="24px" height="24px" stroke-width="1.5" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 20L18 20" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path><path d="M12 16V4M12 4L15.5 7.5M12 4L8.5 7.5" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+        <span>open</span>
+      </label>
+      <button id="sample" class="open-action" title="Load demo sample (forest sounds)"
+        :onclick="() => openSample()">
+        <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px" fill="none"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z" stroke="#000000" stroke-width="1.5" fill="none" stroke-linejoin="round"/></svg>
+        <span>sample</span>
+      </button>
+      <button id="record-new" class="open-action"
+      aria-label="Record from microphone"
+        :title="recording ? 'Stop recording' : 'Record from microphone'"
+        :onclick="() => record()">
+        <svg :if="!recording" width="24px" height="24px" stroke-width="1.5" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="2" width="6" height="12" rx="3" stroke="#000000" stroke-width="1.5"></rect><path d="M5 10V11C5 14.866 8.13401 18 12 18V18V18C15.866 18 19 14.866 19 11V10" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path><path d="M12 18V22M12 22H9M12 22H15" stroke="#000000" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+        <svg :else width="24px" height="24px" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><rect x="7" y="7" width="10" height="10" fill="#e33"/></svg>
+        <span :text="recording ? recording : 'record'"></span>
+      </button>
+      <button id="silence" class="open-action" title="New blank document (3s silence)"
+        :onclick="() => openSilence()">
+        <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 0 24 24" width="24px" fill="none"><path d="M3 12h4l2-5 3 10 2-5h7" stroke="#000000" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" opacity=".25"/><path d="M3 12h18" stroke="#000000" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span>silence</span>
+      </button>
+    </nav>
+    <p id="drop-hint">or drop an audio file anywhere</p>
+
+    <div id="files" :if="files?.length" :scope="{confirmClear: false}">
+      <ul>
+        <li :each="fileInfo in files">
+          <button class="file-button"
+            :onclick="() => loadAudio(fileInfo.id)"
+            :title="`${fileInfo.name} (${(fileInfo.size / 1024 / 1024).toFixed(2)} MB)`">
+            <span class="file-name" :text="fileInfo.name"></span>
+            <span class="file-date" :text="new Date(fileInfo.timestamp).toLocaleDateString()"></span>
+          </button>
+          <button class="delete-button" aria-label="Delete stored file"
+            :title="`Delete ${fileInfo.name} from storage`"
+            :onclick.stop="async () => { await api.deleteFile(fileInfo.id).catch(() => {}); refreshFiles() }">
+            <span>×</span>
+          </button>
+        </li>
+      </ul>
+      <p id="files-foot">
+        <select id="sort" aria-label="Sort files"
+          :onchange="e => (sortBy = e.target.value, refreshFiles())">
+          <option :each="s in ['date','name','size']" :value="s" :text="s" :selected="sortBy === s"></option>
+        </select>
+        <button id="clear-all" :class="{confirm: confirmClear}"
+          :text="confirmClear ? 'sure?' : 'clear all'"
+          :onclick="async () => { if (!confirmClear) return confirmClear = true; confirmClear = false; await api.clearFiles().catch(() => {}); refreshFiles() }"
+          :onblur="() => confirmClear = false"></button>
+        <span id="storage" :if="usage?.usage"
+          :text="`${usage.usage >= 1048576 ? (usage.usage / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(usage.usage / 1024)) + ' KB'} used${usage.quota ? ` of ${(usage.quota / 1073741824).toFixed(1)} GB` : ''}`"></span>
+      </p>
+    </div>
+  </div>
+
+  <div id="minimap" :if="total && !loading">
+    <span id="time" :text="`${timecode(caretOffset)} / ${timecode(total)}`"></span>
+    <button id="clip-warn" class="op" :if="peak > 1"
+      aria-label="Clipping warning"
+      :title="`Peaks ${(20 * Math.log10(peak)).toFixed(1)} dB above full scale — clips on export. Click to normalize.`"
+      :onmousedown.stop.prevent="() => normalize()"
+      tabindex="-1"><span class="fmt" :text="`▲ +${(20 * Math.log10(peak)).toFixed(1)}dB`"></span></button>
+    <div id="mini-wave"
+      :ref="refs.minimapBox"
+      :onpointerdown.prevent="e => minimapSeek(e)"
+      :resize.throttle-raf="() => _refreshMinimap()"
+      :fx="marks, _brs, loop, clipStart, clipEnd; _drawMinimap()">
+      <canvas :ref="refs.minimap"></canvas>
+      <span id="viewport" :style="{ left: scrollFrac * 100 + '%', width: viewFrac * 100 + '%' }"></span>
+    </div>
+    <button id="speed" class="op" aria-label="Playback speed"
+      title="Playback speed"
+      :onmousedown.stop.prevent="() => cycleSpeed()"
+      tabindex="-1"><span class="fmt" :text="speed + '×'"></span></button>
+    <button id="mute" class="op" aria-label="Mute"
+      :title="muted ? 'Unmute' : 'Mute'"
+      :onmousedown.stop.prevent="() => toggleMute()"
+      tabindex="-1">
+      <svg :if="!muted" xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 0 24 24" width="16px" fill="#000000"><path d="M0 0h24v24H0z" fill="none"/><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+      <svg :else xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 0 24 24" width="16px" fill="#000000"><path d="M0 0h24v24H0z" fill="none"/><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+    </button>
+    <input id="volume" type="range" min="0" max="1" step="0.05" aria-label="Volume"
+      title="Volume"
+      :value="volume"
+      :oninput="e => setVolume(e.target.value)"
+      :onpointerdown.stop="e=>e" />
+  </div>
+
+  <div id="toolbar" :if="total && !loading">
+    <!-- blur before jumping: WebKit would otherwise clear the selection the jump
+         just set (and keeps focus on merely-hidden inputs, swallowing global keys) -->
+    <input id="jump" hidden placeholder="m:ss" size="6" aria-label="Jump to time"
+      :ref="refs.jump"
+      :onkeydown.enter.prevent.stop="e => (e.target.blur(), jumpToTime(e.target.value))"
+      :onkeydown.esc.stop="e => e.target.blur()"
+      :onblur="e => e.target.hidden = true" />
+    <button id="help-btn" class="op" aria-label="Keyboard shortcuts"
+      title="Keyboard shortcuts (?)"
+      :onmousedown.stop.prevent="() => showHelp = !showHelp"
+      tabindex="-1"><span class="fmt">?</span></button>
+    <button id="settings-btn" class="op" aria-label="Settings"
+      title="Settings"
+      :onmousedown.stop.prevent="() => showSettings = !showSettings"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000"><path d="M0 0h24v24H0z" fill="none"/><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+    </button>
+    <button id="zoomin" class="op"
+      aria-label="Zoom in"
+      :disabled="blockSize <= 1024"
+      title="Zoom in"
+      :onmousedown.stop.prevent="() => zoom(1)"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+        <path d="M0 0h24v24H0z" fill="none" />
+        <path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zm2.5-4h-2v2H9v-2H7V9h2V7h1v2h2v1z" />
+      </svg>
+    </button>
+    <button id="zoomout" class="op"
+      aria-label="Zoom out"
+      :disabled="blockSize >= 8192"
+      title="Zoom out"
+      :onmousedown.stop.prevent="() => zoom(-1)"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+        <path d="M0 0h24v24H0z" fill="none" />
+        <path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14zM7 9h5v1H7z" />
+      </svg>
+    </button>
+    <button id="record" class="op"
+      aria-label="Record"
+      :class="{rec: recording}"
+      :title="recording ? 'Stop recording' : 'Record at caret'"
+      :onmousedown.stop.prevent="() => record()"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px">
+        <circle :if="!recording" cx="12" cy="12" r="7" fill="#e33" />
+        <rect :else x="6" y="6" width="12" height="12" fill="#e33" />
+      </svg>
+    </button>
+    <button id="trim-edges" class="op"
+      aria-label="Trim edge silence"
+      title="Trim silence at start and end"
+      :onmousedown.stop.prevent="() => trimSilence()"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+        <path d="M0 0h24v24H0z" fill="none" />
+        <path d="M7 6h2v12H7zm8 0h2v12h-2zM3 11h3v2H3zm15 0h3v2h-3zm-7-2h2v6h-2z" />
+      </svg>
+    </button>
+    <button id="shrink" class="op"
+      aria-label="Shrink pauses"
+      title="Shrink pauses (selection or whole file)"
+      :onmousedown.stop.prevent="() => shrink()"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+        <path d="M0 0h24v24H0z" fill="none" />
+        <path d="M8 19h3v3h2v-3h3l-4-4-4 4zm8-14h-3V2h-2v3H8l4 4 4-4zM4 10v2h16v-2H4z" />
+      </svg>
+    </button>
+    <button id="normalize" class="op"
+      aria-label="Normalize loudness"
+      title="Normalize loudness"
+      :onmousedown.stop.prevent="() => normalize()"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+        <path d="M0 0h24v24H0z" fill="none" />
+        <path d="M10 20h4V4h-4v16zm-6 0h4v-8H4v8zM16 9v11h4V9h-4z" />
+      </svg>
+    </button>
+    <button id="download" class="op"
+      aria-label="Download WAV"
+      title="Download WAV (selection if active)"
+      :onmousedown.stop.prevent="() => download('wav')"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+        <path d="M0 0h24v24H0z" fill="none" />
+        <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+      </svg>
+      <span class="fmt">wav</span>
+    </button>
+    <button id="download-mp3" class="op"
+      aria-label="Download MP3"
+      title="Download MP3 (selection if active)"
+      :onmousedown.stop.prevent="() => download('mp3')"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+        <path d="M0 0h24v24H0z" fill="none" />
+        <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+      </svg>
+      <span class="fmt">mp3</span>
+    </button>
+    <button id="download-flac" class="op"
+      aria-label="Download FLAC"
+      title="Download FLAC (selection if active)"
+      :onmousedown.stop.prevent="() => download('flac')"
+      tabindex="-1">
+      <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 0 24 24" width="18px" fill="#000000">
+        <path d="M0 0h24v24H0z" fill="none" />
+        <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+      </svg>
+      <span class="fmt">flac</span>
+    </button>
+  </div>
+
+  <div id="settings" :if="showSettings && total"
+    :onmousedown.stop="e=>e">
+    <label>shrink gap, s
+      <input type="number" min="0" max="5" step="0.1" :value="settings.gap"
+        :onchange="e => setSetting('gap', +e.target.value || 0.3)" /></label>
+    <label>silence, dB
+      <input id="thr" type="number" min="-90" max="0" step="5" placeholder="auto" :value="settings.thr ?? ''"
+        :onchange="e => setSetting('thr', e.target.value === '' ? null : Math.min(0, +e.target.value))" /></label>
+    <label>fade curve
+      <select :onchange="e => setSetting('curve', e.target.value)">
+        <option :each="c in ['linear','exp','log','cos']" :value="c" :text="c" :selected="settings.curve === c"></option>
+      </select></label>
+    <label>normalize
+      <select :onchange="e => setSetting('norm', e.target.value)">
+        <option :each="n in ['peak','-1','-3','streaming','podcast','broadcast']" :value="n" :text="n === 'peak' ? 'peak 0dB' : isNaN(+n) ? n + ' (LUFS)' : 'peak ' + n + 'dB'" :selected="settings.norm === n"></option>
+      </select></label>
+    <label>theme
+      <select :onchange="e => setSetting('theme', e.target.value)">
+        <option :each="t in ['auto','light','dark']" :value="t" :text="t" :selected="settings.theme === t"></option>
+      </select></label>
+  </div>
+
+  <div id="help" :if="showHelp" :onmousedown.stop="e=>e">
+    <b>wavearea</b> — textarea for audio
+    <dl>
+      <dt>Space</dt><dd>insert silence</dd>
+      <dt>Ctrl+Space</dt><dd>play / pause</dd>
+      <dt>Backspace</dt><dd>delete block / join segments</dd>
+      <dt>Enter</dt><dd>split segment</dd>
+      <dt>← → ↑ ↓</dt><dd>move caret (+Shift select, +Ctrl line edge)</dd>
+      <dt>Home / End</dt><dd>line start / end (+Ctrl doc)</dd>
+      <dt>Ctrl+Z / +Shift</dt><dd>undo / redo</dd>
+      <dt>Ctrl+C X V</dt><dd>copy · cut · paste</dd>
+      <dt>m</dt><dd>toggle marker (dblclick to label)</dd>
+      <dt>Ctrl+↑ ↓</dt><dd>previous / next marker</dd>
+      <dt>g</dt><dd>go to time</dd>
+      <dt>Ctrl+scroll</dt><dd>zoom</dd>
+      <dt>Esc</dt><dd>clear selection / close</dd>
+    </dl>
+    <p><a href="https://github.com/audio-lab/wavearea" target="_blank" rel="noopener">github</a> · ॐ</p>
+  </div>
+
+  <div id="progressbar" :if="progress != null" :style="{width: progress * 100 + '%'}"></div>
+
+  <!-- #status is white-space:pre — spans must stay adjacent, whitespace renders -->
+  <div id="status" :if="loading || recording"><span :text="recording ? `● ${recording}` : `${loading}${progress != null ? ` ${Math.round(progress * 100)}%` : ''}${total ? ' · ' + timecode(total) : ''}`"></span><span id="rec-wave" class="wavefont" :if="recording" :text="recWave"></span></div>
+
+  <div id="error" :if="error">
+    <span :text="error"></span>
+    <button id="retry" :if="!total && !loading && _lastLoad" :onclick="() => retry()">retry</button>
+  </div>
+
+</div>
